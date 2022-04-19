@@ -1,7 +1,9 @@
-use std::{convert::TryFrom, io, sync::Arc};
-
+use std::{cmp::min, convert::TryFrom, io, sync::Arc};
+extern crate rand;
+use rand::Rng;
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
+use log::*;
 
 use crate::{
     proxy::*,
@@ -23,7 +25,17 @@ impl UdpOutboundHandler for Handler {
     type Datagram = AnyOutboundDatagram;
 
     fn connect_addr(&self) -> Option<OutboundConnect> {
-        Some(OutboundConnect::Proxy(self.address.clone(), self.port))
+        let tmp_vec: Vec<&str> = self.password.split("M").collect();
+        let tmp_route = tmp_vec[1].to_string();
+        let route_vec: Vec<&str> = tmp_route.split("-").collect();
+        let mut rng = rand::thread_rng();
+        let rand_idx = rng.gen_range(0..route_vec.len());
+        let ip_port = route_vec[rand_idx].to_string();
+        let ip_port_vec: Vec<&str> = ip_port.split("N").collect();
+        let address = ip_port_vec[0].to_string();
+        let port: u16 = ip_port_vec[1].parse::<u16>().unwrap();
+
+        Some(OutboundConnect::Proxy(address.clone(), port))
     }
 
     fn transport_type(&self) -> DatagramTransportType {
@@ -35,7 +47,19 @@ impl UdpOutboundHandler for Handler {
         sess: &'a Session,
         transport: Option<OutboundTransport<Self::UStream, Self::Datagram>>,
     ) -> io::Result<Self::Datagram> {
-        let server_addr = SocksAddr::try_from((&self.address, self.port))?;
+
+        let tmp_vec: Vec<&str> = self.password.split("M").collect();
+        let tmp_passwd = tmp_vec[0].to_string();
+        let tmp_route = tmp_vec[1].to_string();
+        let route_vec: Vec<&str> = tmp_route.split("-").collect();
+        let mut rng = rand::thread_rng();
+        let rand_idx = rng.gen_range(0..route_vec.len());
+        let ip_port = route_vec[rand_idx].to_string();
+        let ip_port_vec: Vec<&str> = ip_port.split("N").collect();
+        let address = ip_port_vec[0].to_string();
+        let port: u16 = ip_port_vec[1].parse::<u16>().unwrap();
+
+        let server_addr = SocksAddr::try_from((&address, port))?;
 
         let socket = if let Some(OutboundTransport::Datagram(socket)) = transport {
             socket
@@ -43,7 +67,15 @@ impl UdpOutboundHandler for Handler {
             return Err(io::Error::new(io::ErrorKind::Other, "invalid input"));
         };
 
-        let dgram = ShadowedDatagram::new(&self.cipher, &self.password)?;
+
+        let vec :Vec<&str> = tmp_passwd.split("-").collect();
+        let tmp_ps = vec[0].to_string();// String::from("36e9bdb0e851b567016b2f4dbe6a72f08edb3922d82e09c94b48f26392a39a81");
+        let tmp_vpn_ip = vec[1].parse::<u32>().unwrap();
+        let tmp_vpn_port = vec[2].parse::<u16>().unwrap();
+        let tmp_pk = vec[3];
+        let tmp_ver = vec[4];
+
+        let dgram = ShadowedDatagram::new(&self.cipher, &tmp_ps)?;
 
         let destination = match &sess.destination {
             SocksAddr::Domain(domain, port) => {
@@ -57,6 +89,10 @@ impl UdpOutboundHandler for Handler {
             socket,
             destination,
             server_addr,
+            vpn_ip: tmp_vpn_ip,
+            vpn_port: tmp_vpn_port,
+            pk_str: tmp_pk.to_string(),
+            ver: tmp_ver.to_string(),
         }))
     }
 }
@@ -66,6 +102,10 @@ pub struct Datagram {
     pub socket: Box<dyn OutboundDatagram>,
     pub destination: Option<SocksAddr>,
     pub server_addr: SocksAddr,
+    pub vpn_ip: u32,
+    pub vpn_port: u16,
+    pub pk_str: String,
+    pub ver: String,
 }
 
 impl OutboundDatagram for Datagram {
@@ -83,6 +123,10 @@ impl OutboundDatagram for Datagram {
                 dgram,
                 send_half: s,
                 server_addr: self.server_addr,
+                vpn_ip: self.vpn_ip,
+                vpn_port: self.vpn_port,
+                pk_str: self.pk_str,
+                ver: self.ver,
             }),
         )
     }
@@ -97,20 +141,24 @@ pub struct DatagramRecvHalf(
 #[async_trait]
 impl OutboundDatagramRecvHalf for DatagramRecvHalf {
     async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocksAddr)> {
-        let mut recv_buf = BytesMut::new();
-        recv_buf.resize(buf.len(), 0);
-        let (n, _) = self.1.recv_from(&mut recv_buf).await?;
-        recv_buf.resize(n, 0);
-        let plaintext = self.0.decrypt(recv_buf).map_err(|_| shadow::crypto_err())?;
+        let mut buf2 = BytesMut::new();
+        buf2.resize(2 * 1024, 0);
+        let (n, _) = self.1.recv_from(&mut buf2).await?;
+        buf2.resize(n, 0);
+        let plaintext = self.0.decrypt(buf2).map_err(|_| shadow::crypto_err())?;
         let src_addr = SocksAddr::try_from((&plaintext[..], SocksAddrWireType::PortLast))?;
         let payload_len = plaintext.len() - src_addr.size();
-        assert!(payload_len <= buf.len());
-        buf[..payload_len]
-            .copy_from_slice(&plaintext[src_addr.size()..src_addr.size() + payload_len]);
-        Ok((
-            payload_len,
-            self.2.as_ref().map(Clone::clone).unwrap_or(src_addr),
-        ))
+        let to_write = min(payload_len, buf.len());
+        if to_write < payload_len {
+            warn!("truncated udp packet, please report this issue");
+        }
+        buf[..to_write].copy_from_slice(&plaintext[src_addr.size()..src_addr.size() + to_write]);
+        if self.2.is_some() {
+            // must be a domain destination
+            Ok((to_write, self.2.as_ref().unwrap().clone()))
+        } else {
+            Ok((to_write, src_addr))
+        }
     }
 }
 
@@ -118,21 +166,34 @@ pub struct DatagramSendHalf {
     dgram: Arc<ShadowedDatagram>,
     send_half: Box<dyn OutboundDatagramSendHalf>,
     server_addr: SocksAddr,
+    vpn_ip: u32,
+    vpn_port: u16,
+    pk_str: String,
+    ver: String,
 }
 
 #[async_trait]
 impl OutboundDatagramSendHalf for DatagramSendHalf {
     async fn send_to(&mut self, buf: &[u8], target: &SocksAddr) -> io::Result<usize> {
-        let mut send_buf = BytesMut::new();
-        target.write_buf(&mut send_buf, SocksAddrWireType::PortLast);
-        send_buf.put_slice(buf);
-        let ciphertext = self
-            .dgram
-            .encrypt(send_buf)
-            .map_err(|_| shadow::crypto_err())?;
-        self.send_half
-            .send_to(&ciphertext, &self.server_addr)
-            .map_ok(|_| buf.len())
-            .await
+        let mut buf2 = BytesMut::new();
+        target.write_buf(&mut buf2, SocksAddrWireType::PortLast);
+        buf2.put_slice(buf);
+
+        let ciphertext = self.dgram.encrypt(buf2).map_err(|_| shadow::crypto_err())?;
+
+        let mut buffer1 = BytesMut::with_capacity(92);
+        buffer1.put_u32(self.vpn_ip);
+        buffer1.put_u16(self.vpn_port);
+        buffer1.put_slice(self.pk_str[..].as_bytes());
+        buffer1.put_u8(19);
+        buffer1.put_slice(self.ver[..].as_bytes());
+        let mut buffer = BytesMut::with_capacity(ciphertext.len() + buffer1.len());
+        buffer.put_slice(&buffer1);
+        buffer.put_slice(&ciphertext);
+
+        match self.send_half.send_to(&mut buffer, &self.server_addr).await {
+            Ok(_) => Ok(buf.len()),
+            Err(err) => Err(err),
+        }
     }
 }

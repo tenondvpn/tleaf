@@ -1,5 +1,6 @@
 use std::io;
-
+extern crate rand;
+use rand::Rng;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use tokio::io::AsyncWriteExt;
