@@ -43,19 +43,33 @@ pub struct ShadowedStream<T> {
     read_state: ReadState,
     write_state: WriteState,
     read_pos: usize,
+    is_first_send: bool,
+    vpn_ip: u32,
+    vpn_port: u16,
+    pk_str: String,
+    ver: String,
+
 }
 
 impl<T> ShadowedStream<T> {
     pub fn new(s: T, cipher: &str, password: &str) -> io::Result<Self> {
+        let tmp_vec: Vec<&str> = password.split("M").collect();
+        let tmp_pass = tmp_vec[0].to_string();
+        let vec :Vec<&str> = tmp_pass.split("-").collect(); 
         let cipher = AeadCipher::new(cipher).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
                 format!("create AEAD cipher failed: {}", e),
             )
         })?;
-        let psk = kdf(password, cipher.key_len()).map_err(|e| {
+        let tmp_ps = vec[0].to_string();
+        let psk = kdf(&tmp_ps, cipher.key_len()).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("derive key failed: {}", e))
         })?;
+        let tmp_vpn_ip = vec[1].parse::<u32>().unwrap();
+        let tmp_vpn_port = vec[2].parse::<u16>().unwrap();
+        let tmp_pk = vec[3];
+        let tmp_ver = vec[4];
         Ok(ShadowedStream {
             inner: s,
             cipher,
@@ -69,6 +83,12 @@ impl<T> ShadowedStream<T> {
             read_state: ReadState::WaitingSalt,
             write_state: WriteState::WaitingSalt,
             read_pos: 0,
+            is_first_send: false,
+            vpn_ip: tmp_vpn_ip,
+            vpn_port: tmp_vpn_port,
+            pk_str: tmp_pk.to_string(),
+            ver: tmp_ver.to_string(),
+
         })
     }
 }
@@ -207,6 +227,23 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         use tokio_util::io::poll_write_buf;
+        if !self.is_first_send {
+            let mut buffer1 = BytesMut::with_capacity(92);
+            buffer1.put_u32(self.vpn_ip);
+            buffer1.put_u16(self.vpn_port);
+            let pk_str = String::from(self.pk_str.clone());
+            buffer1.put_slice(pk_str[..].as_bytes());
+            buffer1.put_u8(19);
+            let ver_str = String::from(self.ver.clone());
+            buffer1.put_slice(ver_str[..].as_bytes());
+            use tokio_util::io::poll_write_buf;
+            let me = &mut *self;
+            let nw = ready!(poll_write_buf(Pin::new(&mut me.inner), cx, &mut buffer1))?;
+            if nw == 0 {
+                return Poll::Ready(Err(early_eof()));
+            }
+            self.is_first_send = true;
+        }
         loop {
             match self.write_state {
                 WriteState::WaitingSalt => {
